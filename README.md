@@ -10,6 +10,8 @@ Chrome 扩展：**把任意标签页的声音实时转成文字**，全部在本
 - **完全本地** — sherpa-onnx (WebAssembly) 跑 Silero VAD + SenseVoice，离线可用
 - **中英混说** — SenseVoice 支持中 / 英 / 日 / 韩 / 粤，自带标点
 - **不乱编** — VAD 只在检测到人声时才送去识别，CTC 模型不会像 Whisper 那样在静音处产生幻觉
+- **保留录音** — 同时存一份 opus 音频（约 15–30 MB/小时），转录有疑问时可以回听
+- **会后精修** — 停止后自动用完整录音重跑一遍，输出更准确的最终稿
 - **自动保存** — 停止转录或关闭标签页时，自动导出 `.txt` 到下载目录
 - **原生侧边栏** — 转录界面在 Chrome 侧边栏，独立于网页
 
@@ -50,10 +52,24 @@ cd meeting-transcription
 ## 工作原理
 
 ```
-chrome.tabCapture ─┐
-                   ├─→ 混音 ─→ 降采样 16 kHz ─→ Silero VAD ─→ SenseVoice ─→ 侧边栏
-麦克风 (可选) ──────┘                            切出人声段      本地识别
+                              ┌─→ Silero VAD ─→ SenseVoice ─→ 侧边栏（实时稿）
+chrome.tabCapture ─┐          │   切出人声段      本地识别
+                   ├─→ 混音 ──┤
+麦克风 (可选) ──────┘          ├─→ 保留 PCM ──→ 停止后重跑（精修稿）
+                              └─→ MediaRecorder → recording_*.webm
 ```
+
+一次会议产出三个文件：`transcript_*_live.txt`（实时稿）、`transcript_*_refined.txt`
+（精修稿）、`recording_*.webm`（录音）。
+
+### 关于精修稿
+
+精修不是简单地"再跑一遍"。实测发现 VAD 会把语音**开头切掉**，导致首字识别错误
+（`开放时间` → `派饭时间`）。精修 pass 在每段人声前后各补 0.4 秒，修掉这类错误。
+
+反直觉的一点：**把相邻语音合并成 10–20 秒的大窗口反而更差**。实测中英混说时，
+合并会让两种语言互相干扰（`开放`→`开饭`、`code`→`good`），因为 SenseVoice 是按
+整段做语言判定的。所以精修保持逐句解码，只加 padding。
 
 - **background.js** — Service Worker：捕获标签音频、状态机、自动保存
 - **offscreen.js** — 离屏文档：音频采集 + WASM 推理（Service Worker 不能用 WebAudio）

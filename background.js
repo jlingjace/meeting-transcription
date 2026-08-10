@@ -130,11 +130,17 @@ async function stopRecording() {
   await chrome.runtime.sendMessage({ target: 'offscreen', type: 'stop-recording' }).catch(() => {});
   await new Promise(r => setTimeout(r, 300));
 
-  // Auto-save, but KEEP the text on screen and in storage — clearing here used to
-  // make a stopped session look like it vanished. It is cleared on the next start.
-  downloadTranscript({ auto: true });
+  // Save the live transcript right away, so nothing is lost even if the user
+  // closes the browser before the refined pass finishes.
+  downloadTranscript({ auto: true, suffix: 'live' });
 
-  await new Promise(r => setTimeout(r, 300)); // let stream tracks be released
+  // Offscreen is still exporting the audio and running the refined pass — it
+  // signals 'session-finished' when done, and only then may we tear it down.
+}
+
+// Called when offscreen reports the refined pass + audio export are complete.
+async function finishSession() {
+  await new Promise(r => setTimeout(r, 300));
   await closeOffscreen().catch(() => {});
 }
 
@@ -148,8 +154,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // Build a .txt from stored transcript and trigger a download.
 // auto:true skips the Save dialog (silent save to Downloads) and stays quiet
 // when there is nothing to save.
-function downloadTranscript({ auto = false } = {}) {
-  const text = storedLines.join('\n');
+function downloadTranscript({ auto = false, suffix = '', lines = null } = {}) {
+  const text = (lines ?? storedLines).join('\n');
   if (!text.trim()) {
     if (!auto) broadcastToUI({ type: 'status-error', message: '还没有转录内容可下载' });
     return;
@@ -158,8 +164,9 @@ function downloadTranscript({ auto = false } = {}) {
   // MV3 service workers have no URL.createObjectURL — use a data URL instead
   const url = 'data:text/plain;charset=utf-8,' + encodeURIComponent(text);
   const ts = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
+  const tag = suffix ? `_${suffix}` : '';
   chrome.downloads.download(
-    { url, filename: `transcript_${ts}.txt`, saveAs: !auto },
+    { url, filename: `transcript_${ts}${tag}.txt`, saveAs: !auto },
     () => {
       if (chrome.runtime.lastError) {
         console.error('[Transcript] download failed:', chrome.runtime.lastError);
@@ -186,6 +193,17 @@ function storeLines(lines) {
   storedLines.push(...lines);
   if (storedLines.length > 2000) storedLines = storedLines.slice(-1000);
   chrome.storage.local.set({ transcript: storedLines });
+}
+
+// Seconds from the start of the recording → MM:SS (refined transcript uses
+// offsets rather than wall-clock, which is what you want when replaying audio)
+function fmtOffset(sec) {
+  const s = Math.max(0, Math.floor(sec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h ? `${h}:${pad(m)}:${pad(ss)}` : `${pad(m)}:${pad(ss)}`;
 }
 
 function fmtTime(iso) {
@@ -224,6 +242,50 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'offscreen-debug') {
     broadcastToUI({ type: 'debug-line', msg: msg.msg, data: msg.data });
+    return;
+  }
+
+  // ── Session recording + refined pass ──
+  if (msg.type === 'audio-ready') {
+    const ts = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
+    chrome.downloads.download(
+      { url: msg.url, filename: `recording_${ts}.${msg.ext || 'webm'}`, saveAs: false },
+      () => {
+        if (chrome.runtime.lastError) {
+          console.error('[Transcript] audio download failed:', chrome.runtime.lastError);
+          broadcastToUI({ type: 'status-error', message: '录音保存失败，转录文本不受影响' });
+        }
+      },
+    );
+    return;
+  }
+
+  if (msg.type === 'refine-start') {
+    broadcastToUI({ type: 'refine-status', done: 0, total: msg.total });
+    return;
+  }
+
+  if (msg.type === 'refine-progress') {
+    broadcastToUI({ type: 'refine-status', done: msg.done, total: msg.total });
+    return;
+  }
+
+  if (msg.type === 'refine-result') {
+    // Replace the fragment-level live text with the wider-context version
+    const lines = (msg.lines || []).map(l => `[${fmtOffset(l.t)}] ${l.text}`);
+    if (lines.length) {
+      storedLines = lines;
+      chrome.storage.local.set({ transcript: storedLines });
+      broadcastToUI({ type: 'refine-done', lines: msg.lines });
+      downloadTranscript({ auto: true, suffix: 'refined', lines });
+    } else {
+      broadcastToUI({ type: 'refine-done', lines: [] });
+    }
+    return;
+  }
+
+  if (msg.type === 'session-finished') {
+    finishSession();
     return;
   }
 

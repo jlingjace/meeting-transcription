@@ -33,7 +33,7 @@ function renderList() {
   const shown = transcript.slice(-60);
   list.innerHTML = shown.map(it => `
     <div class="bubble">
-      <div class="bubble-ts">${fmtTime(it.timestamp)}</div>
+      <div class="bubble-ts">${it.offset != null ? fmtOffset(it.offset) : fmtTime(it.timestamp)}</div>
       <div class="bubble-text">${escHtml(it.text)}</div>
     </div>`).join('');
   list.scrollTop = list.scrollHeight;
@@ -96,8 +96,29 @@ chrome.runtime.onMessage.addListener((msg) => {
       transcript.length = 0;
       renderList();
       break;
+    case 'refine-status':
+      showRefine(msg.done, msg.total);
+      break;
+    case 'refine-done':
+      hideRefine();
+      if (msg.lines?.length) {
+        transcript.length = 0;
+        for (const l of msg.lines) transcript.push({ offset: l.t, text: l.text });
+        renderList();
+      }
+      break;
   }
 });
+
+// The refined pass runs after stopping; show progress so the wait is explained.
+function showRefine(done, total) {
+  const bar = $('model-bar'), label = $('model-label'), fill = $('model-fill');
+  bar.style.display = 'block';
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  label.textContent = `✨ 正在生成精修稿 ${done}/${total}（更大上下文，更准）`;
+  fill.style.width = pct + '%';
+}
+function hideRefine() { $('model-bar').style.display = 'none'; }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -105,6 +126,13 @@ function escHtml(s) {
   return (s || '').replace(/[&<>"']/g, c => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
+function fmtOffset(sec) {
+  const s = Math.max(0, Math.floor(sec));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h ? `${h}:${pad(m)}:${pad(ss)}` : `${pad(m)}:${pad(ss)}`;
+}
+
 function fmtTime(iso) {
   try {
     const d = new Date(iso);

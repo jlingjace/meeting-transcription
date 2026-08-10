@@ -160,5 +160,63 @@ function check(name, cond, extra = '') {
   check('未生成空文件', log.filter(l => l.download).length === 0);
 }
 
+// ── Test 7: recording + refined pass replaces live text and saves both ──
+{
+  console.log('\nTest 7: 录音导出 + 精修稿');
+  const { log, listeners, send } = boot();
+  await listeners.clicked[0]({ id: 42, windowId: 1 });
+  send({ type: 'recording-started' });
+  send({ type: 'transcription-result', text: '碎片 一', timestamp: new Date().toISOString() });
+  send({ type: 'transcription-result', text: '碎片 二', timestamp: new Date().toISOString() });
+  await listeners.clicked[0]({ id: 42, windowId: 1 });   // stop
+  await sleep(500);
+
+  const liveSaved = log.filter(l => l.download && l.download.filename.includes('_live'));
+  check('先保存实时稿', liveSaved.length === 1, JSON.stringify(log.filter(l => l.download).map(l => l.download.filename)));
+
+  // offscreen exports audio, then reports refined lines
+  send({ type: 'audio-ready', url: 'blob:fake', ext: 'webm' });
+  send({ type: 'refine-start', total: 2 });
+  send({ type: 'refine-progress', done: 1, total: 2 });
+  send({ type: 'refine-result', lines: [
+    { t: 0,    text: '这是上下文更完整的第一段' },
+    { t: 21.5, text: '这是第二段' },
+  ]});
+  await sleep(200);
+
+  const audio = log.filter(l => l.download && l.download.filename.startsWith('recording_'));
+  check('导出录音文件', audio.length === 1 && audio[0].download.saveAs === false);
+
+  const refined = log.filter(l => l.download && l.download.filename.includes('_refined'));
+  check('保存精修稿', refined.length === 1);
+  check('精修稿用相对时间戳', refined[0]?.download.body.startsWith('[00:00] 这是上下文更完整的第一段'), refined[0]?.download.body.split('\n')[0]);
+  check('第二段时间戳正确', refined[0]?.download.body.includes('[00:21] 这是第二段'));
+  check('通知 UI 替换为精修稿', log.some(l => l.sendMessage?.type === 'refine-done'));
+
+  // offscreen only now allows teardown
+  const beforeFinish = log.length;
+  send({ type: 'session-finished' });
+  await sleep(500);
+  check('收到 session-finished 才收尾', log.length >= beforeFinish);
+}
+
+// ── Test 8: offscreen must survive until the refined pass reports done ──
+{
+  console.log('\nTest 8: 精修期间不得提前关闭 offscreen');
+  const { log, listeners, send, ctx } = boot();
+  let closed = 0;
+  ctx.chrome.offscreen.closeDocument = async () => { closed++; };
+  await listeners.clicked[0]({ id: 42, windowId: 1 });
+  send({ type: 'recording-started' });
+  send({ type: 'transcription-result', text: '内容', timestamp: new Date().toISOString() });
+  const closedBeforeStop = closed;
+  await listeners.clicked[0]({ id: 42, windowId: 1 });   // stop
+  await sleep(800);
+  check('停止后未立刻关闭 offscreen', closed === closedBeforeStop, `closed=${closed}`);
+  send({ type: 'session-finished' });
+  await sleep(500);
+  check('收到完成信号后关闭', closed > closedBeforeStop);
+}
+
 console.log(failures === 0 ? '\n=== ALL PASS ===' : `\n=== ${failures} FAILED ===`);
 process.exit(failures ? 1 : 0);
