@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<!-- Load order matters:
+     1) sherpa high-level JS (defines OfflineRecognizer / createVad / CircularBuffer as globals)
+     2) offscreen.js (defines the global `Module` object + emscripten callbacks + our capture pipeline)
+     3) the emscripten glue LAST — it auto-runs, loads .wasm + .data, then calls Module.onRuntimeInitialized -->
+<script src="sherpa/sherpa-onnx-asr.js"></script>
+<script src="sherpa/sherpa-onnx-vad.js"></script>
+<script src="offscreen.js"></script>
+<script src="sherpa/sherpa-onnx-wasm-main-vad-asr.js"></script>
+</body>
+</html>

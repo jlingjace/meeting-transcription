@@ -1,0 +1,14 @@
+# Model / runtime binaries — exceed GitHub's 100 MB file limit.
+# Fetch them with: ./download-models.sh
+sherpa/sherpa-onnx-wasm-main-vad-asr.data
+sherpa/models/sensevoice.int8.onnx
+
+# Reference clone of https://github.com/cjpais/Handy (not part of this project)
+Handy/
+
+# Build output
+*.zip
+
+node_modules/
+.DS_Store
+.claude/
