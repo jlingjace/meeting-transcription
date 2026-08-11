@@ -47,7 +47,23 @@
   .empty { color: #aaa; text-align: center; padding: 32px 16px; font-size: 13px; line-height: 1.7; }
   .warn { background:#fff3cd; border:1px solid #ffc107; border-radius:8px; padding:10px 12px; margin-bottom:8px; font-size:12px; color:#856404; }
 
-  #footer { padding: 10px 12px; display: flex; gap: 8px; border-top: 1px solid #eee; background: #fff; flex-shrink: 0; }
+  #ai-bar {
+    padding: 10px 12px 8px; display: flex; gap: 8px; align-items: center;
+    border-top: 1px solid #eee; background: #fff; flex-shrink: 0;
+  }
+  #ai-template {
+    flex: 1; min-width: 0; padding: 7px 8px; font-size: 12px;
+    border: 1px solid #e2e6ea; border-radius: 7px; background: #f8f9fa; color: #495057;
+  }
+  .btn.primary { background: #eef2ff; color: #4338ca; border-color: #a5b4fc; flex: 0 0 auto; padding: 7px 12px; }
+  #ai-hint {
+    display: none; padding: 0 12px 8px; font-size: 11px; color: #16a34a;
+    background: #fff; flex-shrink: 0;
+  }
+  #ai-hint a { color: #4338ca; text-decoration: none; }
+  #ai-hint a:hover { text-decoration: underline; }
+
+  #footer { padding: 0 12px 10px; display: flex; gap: 8px; background: #fff; flex-shrink: 0; }
   .btn { flex: 1; padding: 8px 0; border: 1px solid #e2e6ea; border-radius: 7px; font-size: 12px; font-weight: 600; cursor: pointer; background: #f8f9fa; color: #495057; }
   .btn:hover { background: #e9ecef; }
   .btn.danger { color: #dc3545; border-color: #f5c6cb; }
@@ -73,6 +89,20 @@
   </div>
 
   <div id="list"></div>
+
+  <div id="ai-bar">
+    <select id="ai-template" title="选择要让 AI 做什么">
+      <option value="minutes">会议纪要 + 行动项</option>
+      <option value="polish">修正错字 + 顺句子</option>
+      <option value="raw">仅转录原文</option>
+    </select>
+    <button class="btn primary" id="ai-copy">复制给 AI</button>
+  </div>
+  <div id="ai-hint">
+    已复制到剪贴板 ·
+    <a href="https://claude.ai/new" target="_blank" rel="noopener">打开 Claude</a> ·
+    <a href="https://chatgpt.com/" target="_blank" rel="noopener">打开 ChatGPT</a>
+  </div>
 
   <div id="footer">
     <button class="btn" id="copy">复制</button>

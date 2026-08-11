@@ -13,6 +13,7 @@ $('btn-record').addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: isRecording ? 'stop-recording' : 'ui-start-recording' });
 });
 $('copy').addEventListener('click', copyAll);
+$('ai-copy').addEventListener('click', copyForAI);
 $('clear').addEventListener('click', () => chrome.runtime.sendMessage({ type: 'clear' }));
 $('download').addEventListener('click', () => chrome.runtime.sendMessage({ type: 'download' }));
 
@@ -160,6 +161,73 @@ async function copyAll() {
   const lines = Array.isArray(data?.transcript) ? data.transcript : [];
   if (!lines.length) return;
   try { await navigator.clipboard.writeText(lines.join('\n')); } catch {}
+}
+
+// ─── Export for ChatGPT / Claude ───────────────────────────────────────────────
+// The transcript comes from speech recognition, so it contains homophone errors
+// and broken sentences. Every prompt tells the model to repair them from context
+// and — importantly — to mark what it cannot recover instead of inventing text.
+
+const PROMPTS = {
+  minutes: `以下是一段会议录音的自动转录文本，由本地语音识别生成，可能包含同音错字、断句错误和口语化表达。
+
+请你：
+1. 先根据上下文推断并修正明显的识别错误，特别是人名、产品名、专业术语和数字
+2. 然后输出会议纪要：
+   - **一句话总结**
+   - **讨论要点** —— 按主题归类，不要按时间顺序流水账
+   - **决议事项** —— 已经拍板的结论
+   - **行动项** —— 谁 / 做什么 / 何时前完成；没有明确负责人的标注「待认领」
+   - **待确认** —— 有分歧或悬而未决的问题
+3. 如果某处文本残缺到无法推断，直接标注 [听不清]，**不要编造内容**
+4. 转录没有区分说话人，如果能从上下文判断是不同人在说，可以推测但要标注「（推测）」
+
+转录文本（行首 [MM:SS] 是录音时间戳）：`,
+
+  polish: `以下是语音识别生成的会议转录，可能有同音错字、缺少标点、句子被切断、口语重复。
+
+请输出修正后的通顺文本，要求：
+- 修正同音错字和明显的识别错误（结合上下文判断）
+- 补齐标点，把被切断的句子合并完整
+- 去掉「嗯」「那个」「就是」这类口头禅和无意义重复
+- **保留原意、原有信息量和说话顺序**，不要概括、不要总结、不要增删观点
+- 保留行首的 [MM:SS] 时间戳
+- 无法判断的地方保持原样或标注 [听不清]，不要臆测
+
+转录文本：`,
+
+  raw: '',
+};
+
+async function copyForAI() {
+  const data = await chrome.storage.local.get('transcript');
+  const lines = Array.isArray(data?.transcript) ? data.transcript : [];
+  if (!lines.length) {
+    showError('还没有转录内容可导出');
+    return;
+  }
+
+  const kind = $('ai-template').value;
+  const body = lines.join('\n');
+  const prompt = PROMPTS[kind];
+  const text = prompt ? `${prompt}\n\n---\n${body}\n---` : body;
+
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    showError('复制失败，请用「复制」按钮重试');
+    return;
+  }
+
+  $('ai-hint').style.display = 'block';
+  const btn = $('ai-copy');
+  btn.textContent = '✓ 已复制';
+  setTimeout(() => { btn.textContent = '复制给 AI'; }, 2000);
+
+  // Rough guard: very long meetings can overflow a single chat message.
+  if (text.length > 60000) {
+    showError(`转录较长（约 ${Math.round(text.length / 1000)}k 字符），若 AI 提示超长请分段粘贴`);
+  }
 }
 
 // ─── Init ──────────────────────────────────────────────────────────────────────
