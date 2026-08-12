@@ -33,8 +33,11 @@ function renderList() {
   }
   const shown = transcript.slice(-60);
   list.innerHTML = shown.map(it => `
-    <div class="bubble">
-      <div class="bubble-ts">${it.offset != null ? fmtOffset(it.offset) : fmtTime(it.timestamp)}</div>
+    <div class="bubble${it.speaker === '我' ? ' mine' : ''}">
+      <div class="bubble-ts">
+        ${it.speaker ? `<span class="who">${escHtml(it.speaker)}</span>` : ''}
+        ${it.offset != null ? fmtOffset(it.offset) : fmtTime(it.timestamp)}
+      </div>
       <div class="bubble-text">${escHtml(it.text)}</div>
     </div>`).join('');
   list.scrollTop = list.scrollHeight;
@@ -77,7 +80,7 @@ function updateModelStatus(status, progress) {
 chrome.runtime.onMessage.addListener((msg) => {
   switch (msg.type) {
     case 'transcript-line':
-      transcript.push({ text: msg.text, timestamp: msg.timestamp });
+      transcript.push({ text: msg.text, timestamp: msg.timestamp, speaker: msg.speaker });
       renderList();
       break;
     case 'recording-status':
@@ -104,7 +107,7 @@ chrome.runtime.onMessage.addListener((msg) => {
       hideRefine();
       if (msg.lines?.length) {
         transcript.length = 0;
-        for (const l of msg.lines) transcript.push({ offset: l.t, text: l.text });
+        for (const l of msg.lines) transcript.push({ offset: l.t, text: l.text, speaker: l.speaker });
         renderList();
       }
       break;

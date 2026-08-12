@@ -5,6 +5,33 @@ let isRecording = false;
 let isStarting = false;      // start requested but offscreen hasn't confirmed yet
 let sessionSaved = false;    // current transcript already auto-saved to disk
 let recordingTabId = null;
+let recordingStartedAt = 0;  // wall clock, to map refined offsets back to speaker events
+
+// Who was talking when, reported by the Meet content script. Used to turn the
+// 'remote' channel into a real name; absent on non-Meet pages.
+let speakerEvents = [];      // { at, name }[]
+
+const SPEAKER_LABELS = { me: '我', remote: '对方' };
+
+// Resolve a display name for a channel at a point in wall-clock time.
+function speakerLabel(channel, atMs) {
+  if (channel === 'me') return SPEAKER_LABELS.me;
+  if (channel !== 'remote') return null;
+  const name = nameAt(atMs);
+  return name || SPEAKER_LABELS.remote;
+}
+
+function nameAt(atMs) {
+  if (!speakerEvents.length) return null;
+  // last event at or before atMs (events are appended in order)
+  let found = null;
+  for (const ev of speakerEvents) {
+    if (ev.at <= atMs) found = ev; else break;
+  }
+  // a name only applies for a short while after it was observed
+  if (found && found.name && atMs - found.at < 8000) return found.name;
+  return null;
+}
 
 // On install: open permission page so the user grants mic access once.
 // Offscreen documents can't show prompts themselves, so we need a visible page
@@ -227,11 +254,23 @@ function broadcastToUI(msg) {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
-  // ── From offscreen: local Whisper result ──
+  // ── Who is speaking, from the Meet content script ──
+  if (msg.type === 'meet-speaker') {
+    if (!isRecording) return;
+    const last = speakerEvents[speakerEvents.length - 1];
+    if (!last || last.name !== msg.name) speakerEvents.push({ at: msg.at, name: msg.name });
+    if (speakerEvents.length > 5000) speakerEvents = speakerEvents.slice(-2500);
+    return;
+  }
+
+  // ── From offscreen: transcription result ──
   if (msg.type === 'transcription-result') {
-    const line = `[${fmtTime(msg.timestamp)}] ${msg.text}`;
+    const who = speakerLabel(msg.speaker, Date.now());
+    const line = `[${fmtTime(msg.timestamp)}] ${who ? who + '：' : ''}${msg.text}`;
     storeLines([line]);
-    broadcastToUI({ type: 'transcript-line', text: msg.text, timestamp: msg.timestamp });
+    broadcastToUI({
+      type: 'transcript-line', text: msg.text, timestamp: msg.timestamp, speaker: who,
+    });
     return;
   }
 
@@ -271,12 +310,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'refine-result') {
-    // Replace the fragment-level live text with the wider-context version
-    const lines = (msg.lines || []).map(l => `[${fmtOffset(l.t)}] ${l.text}`);
+    // Replace the fragment-level live text with the padded, re-decoded version.
+    // Offsets are relative to the recording, so map them back to wall clock to
+    // look up who was speaking.
+    const decorated = (msg.lines || []).map(l => ({
+      ...l,
+      speaker: speakerLabel(l.speaker, recordingStartedAt + l.t * 1000),
+    }));
+    const lines = decorated.map(l => `[${fmtOffset(l.t)}] ${l.speaker ? l.speaker + '：' : ''}${l.text}`);
     if (lines.length) {
       storedLines = lines;
       chrome.storage.local.set({ transcript: storedLines });
-      broadcastToUI({ type: 'refine-done', lines: msg.lines });
+      broadcastToUI({ type: 'refine-done', lines: decorated });
       downloadTranscript({ auto: true, suffix: 'refined', lines });
     } else {
       broadcastToUI({ type: 'refine-done', lines: [] });
@@ -298,6 +343,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'recording-started') {
     isRecording = true;
     isStarting = false;
+    recordingStartedAt = Date.now();
+    speakerEvents = [];
     chrome.storage.local.set({ isRecording: true });
     chrome.action.setBadgeText({ text: '●' });
     chrome.action.setBadgeBackgroundColor({ color: '#ef4444' });

@@ -19,33 +19,36 @@
 // The refined pass reuses the PCM we already captured instead of decoding the
 // recorded file, which avoids a decode step (and decodeAudioData quirks).
 
+// Tab audio and the microphone are kept as SEPARATE channels rather than mixed:
+// the split is itself perfect speaker attribution (remote participants vs you),
+// with no diarization model needed. Only the archive file is mixed.
+
 const EXPECTED_SR = 16000;
 const REFINE_PAD_S = 0.4;               // restore speech onset/offset clipped by VAD
-const MAX_RECORD_S = 3 * 3600;          // cap retained PCM (~345 MB) as a backstop
+const MAX_RECORD_S = 2 * 3600;          // per channel; two channels now, so ~460 MB worst case
+const ECHO_DEDUP_MS = 6000;             // window for dropping mic echo of remote speech
 
 let wasmReady   = false;
-let vad         = null;
 let recognizer  = null;
-let circular    = null;
 
 let audioCtx    = null;
 let tabStream   = null;
 let micStream   = null;
-let tabSource   = null;
-let micSource   = null;
-let processor   = null;
 let recordSR    = EXPECTED_SR;
 let isActive    = false;
 
+// One per audio source. 'remote' = other participants (tab), 'me' = microphone.
+let channels    = [];
+
 let pendingStreamId = null; // start requested before wasm finished loading
 
-// Session recording: Int16 PCM kept for the refined pass, plus a compact
-// opus/webm file handed to the user for playback.
-let recordedPcm     = [];   // Int16Array[]
-let recordedSamples = 0;
-let recordCapped    = false;
+// Session recording: a compact mixed opus/webm file handed to the user for
+// playback. Per-channel PCM for the refined pass lives on each channel.
 let mediaRecorder   = null;
 let audioBlobParts  = [];
+
+// Recently emitted remote text, used to drop microphone echo of it
+let recentRemote    = [];   // { text, at }[]
 
 function dbg(msg, data) {
   console.log('[sherpa offscreen]', msg, data ?? '');
@@ -112,9 +115,6 @@ function initRecognizer() {
 }
 
 async function onWasmReady() {
-  vad = createVad(Module);
-  circular = new CircularBuffer(30 * EXPECTED_SR, Module);
-
   // Swap the .data's Chinese-only zipformer for SenseVoice (zh+en+ja+ko+yue).
   // Injected into MEMFS at runtime so we reuse the prebuilt wasm as-is.
   try {
@@ -171,32 +171,31 @@ async function beginCapture(streamId) {
   recordSR = audioCtx.sampleRate;
   dbg('AudioContext sr', recordSR);
 
-  tabSource = audioCtx.createMediaStreamSource(tabStream);
+  const tabSource = audioCtx.createMediaStreamSource(tabStream);
   // Route tab audio to speakers so the user still hears the meeting
   tabSource.connect(audioCtx.destination);
 
-  // Microphone (the user's own voice) — optional; requires the one-time grant
+  // Microphone (the user's own voice) — optional; requires the one-time grant.
+  // Echo cancellation matters here: tab audio is playing through the speakers,
+  // and without AEC the mic re-captures it and we transcribe remote speech twice.
+  let micSource = null;
   try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      video: false,
+    });
     micSource = audioCtx.createMediaStreamSource(micStream);
-    dbg('mic stream', 'ok (tab+mic mixed)');
+    dbg('mic stream', 'ok — 分离通道（我 / 对方）');
   } catch (e) {
-    micStream = null; micSource = null;
-    dbg('mic stream', 'unavailable — tab only (' + e.message + ')');
+    micStream = null;
+    dbg('mic stream', 'unavailable — 仅转录对方 (' + e.message + ')');
   }
 
-  processor = audioCtx.createScriptProcessor(4096, 1, 1);
-  // Both sources feed the processor input; connections sum → tab+mic mix for analysis
-  tabSource.connect(processor);
-  if (micSource) micSource.connect(processor);
-  // processor must connect to destination to fire; it emits silence (we never
-  // write its output buffer) so there is no echo of the mic
-  processor.connect(audioCtx.destination);
+  channels = [makeChannel('remote', tabSource)];
+  if (micSource) channels.push(makeChannel('me', micSource));
 
-  processor.onaudioprocess = onAudio;
-
-  // Separate tap for the archive file: mix the same sources into a stream and
-  // let MediaRecorder encode opus (~15-30 MB/h) instead of storing raw PCM.
+  // Separate tap for the archive file: mix the sources into one stream and let
+  // MediaRecorder encode opus (~15-30 MB/h) instead of storing raw PCM.
   try {
     const mixDest = audioCtx.createMediaStreamDestination();
     tabSource.connect(mixDest);
@@ -216,51 +215,77 @@ async function beginCapture(streamId) {
     dbg('audio recorder unavailable', e.message);
   }
 
-  recordedPcm = [];
-  recordedSamples = 0;
-  recordCapped = false;
-
+  recentRemote = [];
   isActive = true;
   chrome.runtime.sendMessage({ type: 'recording-started' });
   dbg('recording started');
 }
 
-function onAudio(e) {
+// Each source gets its own VAD, buffer and retained PCM, so a segment's channel
+// is the speaker attribution — no diarization model involved.
+function makeChannel(name, source) {
+  const ch = {
+    name,
+    source,
+    vad: createVad(Module),
+    circular: new CircularBuffer(30 * EXPECTED_SR, Module),
+    pcm: [],
+    samples: 0,
+    capped: false,
+    processor: audioCtx.createScriptProcessor(4096, 1, 1),
+  };
+  source.connect(ch.processor);
+  // must be connected to fire; it never writes its output buffer, so it is silent
+  ch.processor.connect(audioCtx.destination);
+  ch.processor.onaudioprocess = (e) => onAudio(ch, e);
+  return ch;
+}
+
+function onAudio(ch, e) {
   if (!isActive || !wasmReady) return;
 
   let samples = new Float32Array(e.inputBuffer.getChannelData(0));
   samples = downsample(samples, recordSR, EXPECTED_SR);
 
   // Retain as Int16 (half the memory of Float32) for the post-meeting re-pass
-  if (!recordCapped) {
-    if (recordedSamples + samples.length > MAX_RECORD_S * EXPECTED_SR) {
-      recordCapped = true;
-      dbg('recording cap reached', `${MAX_RECORD_S}s — 后续不再保留音频用于精修`);
+  if (!ch.capped) {
+    if (ch.samples + samples.length > MAX_RECORD_S * EXPECTED_SR) {
+      ch.capped = true;
+      dbg('recording cap reached', `${ch.name}: ${MAX_RECORD_S}s — 后续不再保留音频用于精修`);
     } else {
       const pcm = new Int16Array(samples.length);
       for (let i = 0; i < samples.length; i++) {
         const v = Math.max(-1, Math.min(1, samples[i]));
         pcm[i] = v * 32767;
       }
-      recordedPcm.push(pcm);
-      recordedSamples += pcm.length;
+      ch.pcm.push(pcm);
+      ch.samples += pcm.length;
     }
   }
 
-  circular.push(samples);
-  const winSize = vad.config.sileroVad.windowSize;
+  ch.circular.push(samples);
+  const winSize = ch.vad.config.sileroVad.windowSize;
 
-  while (circular.size() > winSize) {
-    const s = circular.get(circular.head(), winSize);
-    vad.acceptWaveform(s);
-    circular.pop(winSize);
+  while (ch.circular.size() > winSize) {
+    const s = ch.circular.get(ch.circular.head(), winSize);
+    ch.vad.acceptWaveform(s);
+    ch.circular.pop(winSize);
 
-    while (!vad.isEmpty()) {
-      const segment = vad.front();
-      vad.pop();
-      transcribeSegment(segment.samples);
+    while (!ch.vad.isEmpty()) {
+      const segment = ch.vad.front();
+      ch.vad.pop();
+      transcribeSegment(segment.samples, ch.name);
     }
   }
+}
+
+// Even with AEC the mic can leak remote speech. Text-level dedup is safer than
+// dropping audio: only skip a 'me' segment that repeats remote text verbatim.
+function isEcho(text, speaker) {
+  if (speaker !== 'me') return false;
+  const now = Date.now();
+  recentRemote = recentRemote.filter(r => now - r.at < ECHO_DEDUP_MS);
+  return recentRemote.some(r => r.text === text);
 }
 
 // Decode one chunk of PCM. Returns '' on failure so callers can keep going.
@@ -275,20 +300,27 @@ function decodePcm(samples) {
   }
 }
 
-function transcribeSegment(samples) {
+function transcribeSegment(samples, speaker) {
   const dur = samples.length / EXPECTED_SR;
   if (dur < 0.2) return; // ignore ultra-short blips
 
   try {
     const text = decodePcm(samples);
-    dbg('segment', `dur=${dur.toFixed(1)}s text="${text}"`);
-    if (text) {
-      chrome.runtime.sendMessage({
-        type: 'transcription-result',
-        text,
-        timestamp: new Date().toISOString(),
-      });
+    dbg('segment', `[${speaker}] dur=${dur.toFixed(1)}s text="${text}"`);
+    if (!text) return;
+
+    if (isEcho(text, speaker)) {
+      dbg('echo dropped', text);
+      return;
     }
+    if (speaker === 'remote') recentRemote.push({ text, at: Date.now() });
+
+    chrome.runtime.sendMessage({
+      type: 'transcription-result',
+      text,
+      speaker,
+      timestamp: new Date().toISOString(),
+    });
   } catch (err) {
     dbg('decode error', err.message);
     chrome.runtime.sendMessage({ type: 'transcription-error', error: err.message });
@@ -318,24 +350,26 @@ function downsample(buffer, fromRate, toRate) {
 // still transcribed), export the recording, then run the refined pass.
 async function finishAndCleanup() {
   isActive = false;
-  try {
-    if (vad && wasmReady) {
-      vad.flush();
-      while (!vad.isEmpty()) {
-        const segment = vad.front();
-        vad.pop();
-        transcribeSegment(segment.samples);
+  for (const ch of channels) {
+    try {
+      if (ch.vad && wasmReady) {
+        ch.vad.flush();
+        while (!ch.vad.isEmpty()) {
+          const segment = ch.vad.front();
+          ch.vad.pop();
+          transcribeSegment(segment.samples, ch.name);
+        }
       }
+    } catch (e) {
+      dbg('flush error', `${ch.name}: ${e.message}`);
     }
-  } catch (e) {
-    dbg('flush error', e.message);
   }
 
   await exportRecording();   // hand the audio file to background
   cleanup();                 // release mic/tab/audio nodes (PCM stays in memory)
-  await runRefinedPass();    // re-decode with wider context
-  recordedPcm = [];          // only now is the PCM no longer needed
-  recordedSamples = 0;
+  await runRefinedPass();    // re-decode with padding, per channel
+  for (const ch of channels) { ch.pcm = []; ch.samples = 0; }
+  channels = [];
   chrome.runtime.sendMessage({ type: 'session-finished' });
 }
 
@@ -369,76 +403,87 @@ function exportRecording() {
 // padding around each utterance. See the note at the top for why padding helps
 // and why merging into larger windows does not.
 async function runRefinedPass() {
-  if (!wasmReady || !recognizer || recordedSamples === 0) return;
+  if (!wasmReady || !recognizer) return;
 
-  const pcm = new Float32Array(recordedSamples);
-  let off = 0;
-  for (const chunk of recordedPcm) {
-    for (let i = 0; i < chunk.length; i++) pcm[off + i] = chunk[i] / 32768;
-    off += chunk.length;
-  }
-
-  // Re-run VAD over the whole recording to get speech spans with offsets
-  const spans = [];
-  const collect = () => {
-    while (!vad.isEmpty()) {
-      const seg = vad.front();
-      vad.pop();
-      spans.push({ start: seg.start, end: seg.start + seg.samples.length });
+  // Plan every channel first so progress covers the whole job, not one channel
+  const jobs = [];
+  for (const ch of channels) {
+    if (ch.samples === 0) continue;
+    const pcm = new Float32Array(ch.samples);
+    let off = 0;
+    for (const chunk of ch.pcm) {
+      for (let i = 0; i < chunk.length; i++) pcm[off + i] = chunk[i] / 32768;
+      off += chunk.length;
     }
-  };
-  try {
-    vad.reset();
-    const win = vad.config.sileroVad.windowSize;
-    for (let i = 0; i + win <= pcm.length; i += win) {
-      vad.acceptWaveform(pcm.subarray(i, i + win));
-      collect();
-    }
-    vad.flush();
-    collect();
-  } catch (e) {
-    dbg('refined vad error', e.message);
-    return;
+    for (const w of planWindows(ch, pcm)) jobs.push({ pcm, speaker: ch.name, ...w });
   }
-  if (spans.length === 0) return;
+  if (jobs.length === 0) return;
 
-  // Pad each utterance so the VAD's tight boundaries don't clip word onsets
-  const pad = Math.round(REFINE_PAD_S * EXPECTED_SR);
-  const windows = spans.map(s => ({
-    start: Math.max(0, s.start - pad),
-    end: Math.min(pcm.length, s.end + pad),
-  }));
-
-  dbg('refined pass', `${windows.length} 段（padding ${REFINE_PAD_S}s）`);
-  chrome.runtime.sendMessage({ type: 'refine-start', total: windows.length });
+  dbg('refined pass', `${jobs.length} 段 / ${channels.length} 个通道（padding ${REFINE_PAD_S}s）`);
+  chrome.runtime.sendMessage({ type: 'refine-start', total: jobs.length });
 
   const lines = [];
-  for (let i = 0; i < windows.length; i++) {
-    const { start, end } = windows[i];
+  for (let i = 0; i < jobs.length; i++) {
+    const j = jobs[i];
     try {
-      const text = decodePcm(pcm.subarray(start, end));
-      if (text) lines.push({ t: start / EXPECTED_SR, text });
+      const text = decodePcm(j.pcm.subarray(j.start, j.end));
+      if (text) lines.push({ t: j.start / EXPECTED_SR, text, speaker: j.speaker });
     } catch (e) {
       dbg('refined decode error', e.message);
     }
-    chrome.runtime.sendMessage({ type: 'refine-progress', done: i + 1, total: windows.length });
+    chrome.runtime.sendMessage({ type: 'refine-progress', done: i + 1, total: jobs.length });
     await new Promise(r => setTimeout(r, 0)); // yield so messages flush
   }
+
+  // Channels were decoded one after another; interleave them back into real order
+  lines.sort((a, b) => a.t - b.t);
 
   chrome.runtime.sendMessage({ type: 'refine-result', lines });
   dbg('refined pass done', `${lines.length} 行`);
 }
 
+// Re-run VAD over a whole channel and pad each utterance so the VAD's tight
+// boundaries don't clip word onsets.
+function planWindows(ch, pcm) {
+  const spans = [];
+  const collect = () => {
+    while (!ch.vad.isEmpty()) {
+      const seg = ch.vad.front();
+      ch.vad.pop();
+      spans.push({ start: seg.start, end: seg.start + seg.samples.length });
+    }
+  };
+  try {
+    ch.vad.reset();
+    const win = ch.vad.config.sileroVad.windowSize;
+    for (let i = 0; i + win <= pcm.length; i += win) {
+      ch.vad.acceptWaveform(pcm.subarray(i, i + win));
+      collect();
+    }
+    ch.vad.flush();
+    collect();
+  } catch (e) {
+    dbg('refined vad error', `${ch.name}: ${e.message}`);
+    return [];
+  }
+
+  const pad = Math.round(REFINE_PAD_S * EXPECTED_SR);
+  return spans.map(s => ({
+    start: Math.max(0, s.start - pad),
+    end: Math.min(pcm.length, s.end + pad),
+  }));
+}
+
 function cleanup() {
   isActive = false;
-  if (processor) { processor.disconnect(); processor.onaudioprocess = null; processor = null; }
-  if (tabSource) { tabSource.disconnect(); tabSource = null; }
-  if (micSource) { micSource.disconnect(); micSource = null; }
+  for (const ch of channels) {
+    if (ch.processor) { ch.processor.disconnect(); ch.processor.onaudioprocess = null; ch.processor = null; }
+    if (ch.source) { try { ch.source.disconnect(); } catch (e) {} ch.source = null; }
+    try { ch.circular.reset(); } catch (e) {}
+  }
   if (tabStream) { tabStream.getTracks().forEach(t => t.stop()); tabStream = null; }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
   if (audioCtx)  { audioCtx.close(); audioCtx = null; }
-  if (vad) { try { vad.reset(); } catch (e) {} }
-  if (circular) { try { circular.reset(); } catch (e) {} }
   chrome.runtime.sendMessage({ type: 'recording-stopped' });
   dbg('recording stopped, resources released');
 }

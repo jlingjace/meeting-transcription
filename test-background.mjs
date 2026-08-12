@@ -218,5 +218,69 @@ function check(name, cond, extra = '') {
   check('收到完成信号后关闭', closed > closedBeforeStop);
 }
 
+// ── Test 9: channel split gives speaker labels without any diarization ──
+{
+  console.log('\nTest 9: 我 / 对方 通道分离');
+  const { log, listeners, send } = boot();
+  await listeners.clicked[0]({ id: 42, windowId: 1 });
+  send({ type: 'recording-started' });
+  send({ type: 'transcription-result', text: '你们那边进度如何', speaker: 'remote', timestamp: new Date().toISOString() });
+  send({ type: 'transcription-result', text: '这周能做完',       speaker: 'me',     timestamp: new Date().toISOString() });
+  await sleep(100);
+
+  const lines = log.filter(l => l.sendMessage?.type === 'transcript-line');
+  check('远端标注「对方」', lines[0]?.sendMessage.speaker === '对方', lines[0]?.sendMessage.speaker);
+  check('本人标注「我」',   lines[1]?.sendMessage.speaker === '我',   lines[1]?.sendMessage.speaker);
+
+  send({ type: 'download' });
+  await sleep(50);
+  const body = log.filter(l => l.download)[0]?.download.body || '';
+  check('导出文本含说话人', body.includes('对方：你们那边进度如何') && body.includes('我：这周能做完'), body);
+}
+
+// ── Test 10: Meet speaker names beat the generic label ──
+{
+  console.log('\nTest 10: Meet 真实姓名');
+  const { log, listeners, send } = boot();
+  await listeners.clicked[0]({ id: 42, windowId: 1 });
+  send({ type: 'recording-started' });
+  const t0 = Date.now();
+  send({ type: 'meet-speaker', name: '李明', at: t0 });
+  send({ type: 'transcription-result', text: '接口周三前联调完', speaker: 'remote', timestamp: new Date().toISOString() });
+  await sleep(50);
+
+  let lines = log.filter(l => l.sendMessage?.type === 'transcript-line');
+  check('用真实姓名而非「对方」', lines[0]?.sendMessage.speaker === '李明', lines[0]?.sendMessage.speaker);
+
+  // a stale name must not stick to speech minutes later
+  send({ type: 'meet-speaker', name: null, at: t0 + 1 });
+  send({ type: 'transcription-result', text: '好的', speaker: 'remote', timestamp: new Date().toISOString() });
+  await sleep(50);
+  lines = log.filter(l => l.sendMessage?.type === 'transcript-line');
+  check('姓名消失后退回「对方」', lines[1]?.sendMessage.speaker === '对方', lines[1]?.sendMessage.speaker);
+}
+
+// ── Test 11: refined pass keeps speakers and interleaves channels by time ──
+{
+  console.log('\nTest 11: 精修稿保留说话人并按时间排序');
+  const { log, listeners, send } = boot();
+  await listeners.clicked[0]({ id: 42, windowId: 1 });
+  send({ type: 'recording-started' });
+  send({ type: 'transcription-result', text: 'x', speaker: 'remote', timestamp: new Date().toISOString() });
+  await listeners.clicked[0]({ id: 42, windowId: 1 });
+  await sleep(500);
+
+  send({ type: 'refine-result', lines: [
+    { t: 0,  text: '你们那边进度如何', speaker: 'remote' },
+    { t: 12, text: '这周能做完',       speaker: 'me' },
+  ]});
+  await sleep(200);
+
+  const refined = log.filter(l => l.download && l.download.filename.includes('_refined'))[0];
+  const out = refined?.download.body || '';
+  check('第一行是对方', out.split('\n')[0] === '[00:00] 对方：你们那边进度如何', out.split('\n')[0]);
+  check('第二行是我',   out.split('\n')[1] === '[00:12] 我：这周能做完', out.split('\n')[1]);
+}
+
 console.log(failures === 0 ? '\n=== ALL PASS ===' : `\n=== ${failures} FAILED ===`);
 process.exit(failures ? 1 : 0);
