@@ -6,6 +6,9 @@ let isStarting = false;      // start requested but offscreen hasn't confirmed y
 let sessionSaved = false;    // current transcript already auto-saved to disk
 let recordingTabId = null;
 let recordingStartedAt = 0;  // wall clock, to map refined offsets back to speaker events
+// Bumped per session. A refined pass from a previous recording can land after
+// the next one has started; without this its lines overwrite the new session's.
+let currentSession = 0;
 
 // Who was talking when, reported by the Meet content script. Used to turn the
 // 'remote' channel into a real name; absent on non-Meet pages.
@@ -69,8 +72,9 @@ async function startForTab(tabId) {
     sessionSaved = false;
 
     recordingTabId = tabId;
+    currentSession++;
     const streamId = await acquireStreamId(tabId);
-    await startRecording(streamId);
+    await startRecording(streamId, currentSession);
   } catch (e) {
     console.error('[Transcript] start failed:', e);
     isStarting = false;
@@ -131,11 +135,11 @@ async function closeOffscreen() {
 
 // ─── Recording control ────────────────────────────────────────────────────────
 
-async function startRecording(streamId) {
+async function startRecording(streamId, session) {
   if (isRecording) return;
   try {
     await ensureOffscreen();
-    await chrome.runtime.sendMessage({ target: 'offscreen', type: 'start-recording', streamId });
+    await chrome.runtime.sendMessage({ target: 'offscreen', type: 'start-recording', streamId, sessionId: session });
   } catch (e) {
     console.error('[Transcript] startRecording failed:', e);
     broadcastToUI({ type: 'status-error', message: `启动失败: ${e.message}` });
@@ -265,6 +269,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // ── From offscreen: transcription result ──
   if (msg.type === 'transcription-result') {
+    if (msg.sessionId !== currentSession) return;   // stale session
     const who = speakerLabel(msg.speaker, Date.now());
     const line = `[${fmtTime(msg.timestamp)}] ${who ? who + '：' : ''}${msg.text}`;
     storeLines([line]);
@@ -310,6 +315,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'refine-result') {
+    if (msg.sessionId !== currentSession) return;   // stale session
     // Replace the fragment-level live text with the padded, re-decoded version.
     // Offsets are relative to the recording, so map them back to wall clock to
     // look up who was speaking.

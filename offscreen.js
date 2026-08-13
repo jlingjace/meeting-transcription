@@ -41,6 +41,9 @@ let isActive    = false;
 let channels    = [];
 
 let pendingStreamId = null; // start requested before wasm finished loading
+let pendingSession  = null;
+let sessionId       = 0;    // stamped on every result so background can discard
+                            // late output from a session the user already ended
 
 // Session recording: a compact mixed opus/webm file handed to the user for
 // playback. Per-channel PCM for the refined pass lives on each channel.
@@ -129,9 +132,10 @@ async function onWasmReady() {
   chrome.runtime.sendMessage({ type: 'model-status', status: 'ready' });
 
   if (pendingStreamId) {
-    const id = pendingStreamId;
+    const id = pendingStreamId, session = pendingSession;
     pendingStreamId = null;
-    beginCapture(id).catch(e => dbg('beginCapture error', e.message));
+    pendingSession = null;
+    beginCapture(id, session).catch(e => dbg('beginCapture error', e.message));
   }
 }
 
@@ -157,8 +161,9 @@ async function injectSenseVoice() {
 
 // ─── Audio capture ──────────────────────────────────────────────────────────────
 
-async function beginCapture(streamId) {
+async function beginCapture(streamId, session) {
   if (isActive) return;
+  sessionId = session;
 
   // Tab audio (remote participants) — required
   tabStream = await navigator.mediaDevices.getUserMedia({
@@ -167,9 +172,11 @@ async function beginCapture(streamId) {
   });
   dbg('tab stream', tabStream.getAudioTracks().length + ' track(s)');
 
-  audioCtx = new AudioContext(); // native rate (usually 48000); we downsample to 16k ourselves
+  audioCtx = new AudioContext(); // native rate; the worklet downsamples to 16k
   recordSR = audioCtx.sampleRate;
   dbg('AudioContext sr', recordSR);
+
+  await audioCtx.audioWorklet.addModule(chrome.runtime.getURL('capture-worklet.js'));
 
   const tabSource = audioCtx.createMediaStreamSource(tabStream);
   // Route tab audio to speakers so the user still hears the meeting
@@ -232,20 +239,18 @@ function makeChannel(name, source) {
     pcm: [],
     samples: 0,
     capped: false,
-    processor: audioCtx.createScriptProcessor(4096, 1, 1),
+    node: new AudioWorkletNode(audioCtx, 'capture'),
   };
-  source.connect(ch.processor);
-  // must be connected to fire; it never writes its output buffer, so it is silent
-  ch.processor.connect(audioCtx.destination);
-  ch.processor.onaudioprocess = (e) => onAudio(ch, e);
+  // Capture runs on the audio thread; chunks arrive already at 16 kHz.
+  ch.node.port.onmessage = (e) => onAudio(ch, e.data);
+  source.connect(ch.node);
+  // must be connected for the graph to pull it; it writes no output, so silent
+  ch.node.connect(audioCtx.destination);
   return ch;
 }
 
-function onAudio(ch, e) {
+function onAudio(ch, samples) {
   if (!isActive || !wasmReady) return;
-
-  let samples = new Float32Array(e.inputBuffer.getChannelData(0));
-  samples = downsample(samples, recordSR, EXPECTED_SR);
 
   // Retain as Int16 (half the memory of Float32) for the post-meeting re-pass
   if (!ch.capped) {
@@ -274,9 +279,60 @@ function onAudio(ch, e) {
     while (!ch.vad.isEmpty()) {
       const segment = ch.vad.front();
       ch.vad.pop();
-      transcribeSegment(segment.samples, ch.name);
+      enqueueSegment(segment.samples, ch.name);
     }
   }
+}
+
+// Decoding is synchronous WASM and takes ~1-2 s. Queue it and yield between
+// jobs so VAD/port messages keep flowing instead of piling up behind one decode.
+const pendingSegments = [];
+let draining = false;
+
+function enqueueSegment(samples, speaker) {
+  pendingSegments.push({ samples, speaker });
+  drainSegments();
+}
+
+async function drainSegments() {
+  if (draining) return;
+  draining = true;
+  while (pendingSegments.length) {
+    const job = pendingSegments.shift();
+    transcribeSegment(job.samples, job.speaker);
+    await new Promise(r => setTimeout(r, 0));
+  }
+  draining = false;
+}
+
+function waitForQueue() {
+  return new Promise((resolve) => {
+    const check = () => (!draining && pendingSegments.length === 0)
+      ? resolve() : setTimeout(check, 50);
+    check();
+  });
+}
+
+// Degraded audio makes the model stutter — it emits a character or a short token
+// over and over ("你你你你你…", "5,5,5,5,"). Collapsing the runs keeps the real
+// tail of the sentence, which dropping the whole line would throw away.
+function cleanText(raw) {
+  let s = (raw || '').trim();
+  if (!s) return '';
+
+  s = s.replace(/(.)\1{2,}/gu, '$1');              // 你你你你 → 你
+  s = s.replace(/(.{2,4}?)(?:\1){2,}/gu, '$1');    // 5,5,5,5, / five five five → once
+  s = s.replace(/\s{2,}/g, ' ').trim();
+
+  // Nothing left but punctuation or a lone character: this was noise, not speech
+  const letters = s.replace(/[\s\p{P}\p{S}]/gu, '');
+  if (letters.length < 2) return '';
+
+  // The user speaks Chinese and English; kana/hangul here means the model
+  // mis-identified the language on non-speech audio
+  if (/[぀-ヿ가-힯]/.test(s)) return '';
+
+  return s;
 }
 
 // Even with AEC the mic can leak remote speech. Text-level dedup is safer than
@@ -305,8 +361,9 @@ function transcribeSegment(samples, speaker) {
   if (dur < 0.2) return; // ignore ultra-short blips
 
   try {
-    const text = decodePcm(samples);
-    dbg('segment', `[${speaker}] dur=${dur.toFixed(1)}s text="${text}"`);
+    const raw = decodePcm(samples);
+    const text = cleanText(raw);
+    dbg('segment', `[${speaker}] dur=${dur.toFixed(1)}s "${raw}"${text !== raw ? ` → "${text}"` : ''}`);
     if (!text) return;
 
     if (isEcho(text, speaker)) {
@@ -317,6 +374,7 @@ function transcribeSegment(samples, speaker) {
 
     chrome.runtime.sendMessage({
       type: 'transcription-result',
+      sessionId,
       text,
       speaker,
       timestamp: new Date().toISOString(),
@@ -325,23 +383,6 @@ function transcribeSegment(samples, speaker) {
     dbg('decode error', err.message);
     chrome.runtime.sendMessage({ type: 'transcription-error', error: err.message });
   }
-}
-
-// Average-pooling downsampler (from the sherpa demo)
-function downsample(buffer, fromRate, toRate) {
-  if (toRate === fromRate) return buffer;
-  const ratio = fromRate / toRate;
-  const newLen = Math.round(buffer.length / ratio);
-  const result = new Float32Array(newLen);
-  let iOut = 0, iIn = 0;
-  while (iOut < newLen) {
-    const nextIn = Math.round((iOut + 1) * ratio);
-    let acc = 0, cnt = 0;
-    for (let i = iIn; i < nextIn && i < buffer.length; i++) { acc += buffer[i]; cnt++; }
-    result[iOut] = cnt ? acc / cnt : 0;
-    iOut++; iIn = nextIn;
-  }
-  return result;
 }
 
 // ─── Cleanup ──────────────────────────────────────────────────────────────────
@@ -357,7 +398,7 @@ async function finishAndCleanup() {
         while (!ch.vad.isEmpty()) {
           const segment = ch.vad.front();
           ch.vad.pop();
-          transcribeSegment(segment.samples, ch.name);
+          enqueueSegment(segment.samples, ch.name);
         }
       }
     } catch (e) {
@@ -365,6 +406,7 @@ async function finishAndCleanup() {
     }
   }
 
+  await waitForQueue();      // let already-queued segments finish decoding
   await exportRecording();   // hand the audio file to background
   cleanup();                 // release mic/tab/audio nodes (PCM stays in memory)
   await runRefinedPass();    // re-decode with padding, per channel
@@ -426,7 +468,7 @@ async function runRefinedPass() {
   for (let i = 0; i < jobs.length; i++) {
     const j = jobs[i];
     try {
-      const text = decodePcm(j.pcm.subarray(j.start, j.end));
+      const text = cleanText(decodePcm(j.pcm.subarray(j.start, j.end)));
       if (text) lines.push({ t: j.start / EXPECTED_SR, text, speaker: j.speaker });
     } catch (e) {
       dbg('refined decode error', e.message);
@@ -438,7 +480,7 @@ async function runRefinedPass() {
   // Channels were decoded one after another; interleave them back into real order
   lines.sort((a, b) => a.t - b.t);
 
-  chrome.runtime.sendMessage({ type: 'refine-result', lines });
+  chrome.runtime.sendMessage({ type: 'refine-result', sessionId, lines });
   dbg('refined pass done', `${lines.length} 行`);
 }
 
@@ -477,7 +519,7 @@ function planWindows(ch, pcm) {
 function cleanup() {
   isActive = false;
   for (const ch of channels) {
-    if (ch.processor) { ch.processor.disconnect(); ch.processor.onaudioprocess = null; ch.processor = null; }
+    if (ch.node) { ch.node.port.onmessage = null; ch.node.disconnect(); ch.node = null; }
     if (ch.source) { try { ch.source.disconnect(); } catch (e) {} ch.source = null; }
     try { ch.circular.reset(); } catch (e) {}
   }
@@ -495,11 +537,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.type === 'start-recording') {
     if (wasmReady) {
-      beginCapture(message.streamId)
+      beginCapture(message.streamId, message.sessionId)
         .then(() => sendResponse({ ok: true }))
         .catch(e => { dbg('start error', e.message); sendResponse({ ok: false, error: e.message }); });
     } else {
       pendingStreamId = message.streamId;
+      pendingSession = message.sessionId;
       chrome.runtime.sendMessage({ type: 'model-status', status: 'loading' });
       dbg('start queued — waiting for model to finish loading');
       sendResponse({ ok: true, queued: true });

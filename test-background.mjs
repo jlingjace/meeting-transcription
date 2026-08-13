@@ -59,7 +59,8 @@ function boot() {
   const { api, listeners } = makeChrome(log);
   const ctx = vm.createContext({ chrome: api, console, setTimeout, clearTimeout, Date, Blob: class {}, URL });
   vm.runInContext(SRC, ctx);
-  const send = (msg) => { for (const f of listeners.message) f(msg, {}, () => {}); };
+  // default to the first session; tests that need a specific one pass it explicitly
+  const send = (msg) => { for (const f of listeners.message) f({ sessionId: 1, ...msg }, {}, () => {}); };
   return { log, listeners, send, ctx };
 }
 
@@ -280,6 +281,44 @@ function check(name, cond, extra = '') {
   const out = refined?.download.body || '';
   check('第一行是对方', out.split('\n')[0] === '[00:00] 对方：你们那边进度如何', out.split('\n')[0]);
   check('第二行是我',   out.split('\n')[1] === '[00:12] 我：这周能做完', out.split('\n')[1]);
+}
+
+// ── Test 12: a previous session's refined pass must not pollute the new one ──
+// This is the bug that produced one .txt containing both [MM:SS] refined lines
+// from an earlier recording and [HH:MM:SS] live lines from the current one,
+// with most of the current session's text overwritten.
+{
+  console.log('\nTest 12: 上一场的精修结果不得污染新一场');
+  const { log, listeners, send } = boot();
+
+  // session 1: record and stop, but its refined pass has NOT come back yet
+  await listeners.clicked[0]({ id: 42, windowId: 1 });
+  send({ sessionId: 1, type: 'recording-started' });
+  send({ sessionId: 1, type: 'transcription-result', text: '第一场内容', speaker: 'remote', timestamp: new Date().toISOString() });
+  await listeners.clicked[0]({ id: 42, windowId: 1 });
+  await sleep(500);
+
+  // session 2 starts while session 1 is still refining
+  await listeners.clicked[0]({ id: 42, windowId: 1 });
+  send({ sessionId: 2, type: 'recording-started' });
+  send({ sessionId: 2, type: 'transcription-result', text: '第二场内容', speaker: 'remote', timestamp: new Date().toISOString() });
+  await sleep(100);
+
+  // session 1's refined result arrives late
+  send({ sessionId: 1, type: 'refine-result', lines: [{ t: 0, text: '第一场精修', speaker: 'remote' }] });
+  await sleep(200);
+
+  send({ sessionId: 2, type: 'download' });
+  await sleep(100);
+  const body = log.filter(l => l.download && l.download.saveAs === true).pop()?.download.body || '';
+  check('新会话不含旧会话精修内容', !body.includes('第一场精修'), body);
+  check('新会话内容完好', body.includes('第二场内容'), body);
+
+  // and the current session's own refined result still applies
+  send({ sessionId: 2, type: 'refine-result', lines: [{ t: 3, text: '第二场精修', speaker: 'me' }] });
+  await sleep(200);
+  const refined = log.filter(l => l.download && l.download.filename.includes('_refined')).pop();
+  check('当前会话精修正常生效', refined?.download.body.includes('第二场精修'), refined?.download.body);
 }
 
 console.log(failures === 0 ? '\n=== ALL PASS ===' : `\n=== ${failures} FAILED ===`);
